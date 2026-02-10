@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-eu
+  namespace: kong
+  labels:
+    app: backend-eu
+    region: eu
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-eu
+  template:
+    metadata:
+      labels:
+        app: backend-eu
+    spec:
+      containers:
+      - name: echo
+        image: ealen/echo-server:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: PORT
+          value: "80"
+        - name: ENABLE_LOGS
+          value: "false"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-eu
+  namespace: kong
+spec:
+  selector:
+    app: backend-eu
+  ports:
+  - port: 80
+    targetPort: 80
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-us
+  namespace: kong
+  labels:
+    app: backend-us
+    region: us
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-us
+  template:
+    metadata:
+      labels:
+        app: backend-us
+    spec:
+      containers:
+      - name: echo
+        image: ealen/echo-server:latest
+        ports:
+        - containerPort: 80
+        env:
+        - name: PORT
+          value: "80"
+        - name: ENABLE_LOGS
+          value: "false"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-us
+  namespace: kong
+spec:
+  selector:
+    app: backend-us
+  ports:
+  - port: 80
+    targetPort: 80

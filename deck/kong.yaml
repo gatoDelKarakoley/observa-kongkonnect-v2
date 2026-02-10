@@ -1,0 +1,333 @@
+_format_version: "3.0"
+
+# Global plugins for observability
+plugins:
+  # Prometheus metrics
+  - name: prometheus
+    config:
+      status_code_metrics: true
+      latency_metrics: true
+      bandwidth_metrics: true
+      upstream_health_metrics: true
+
+  # OpenTelemetry - Traces distribuées
+  - name: opentelemetry
+    config:
+      endpoint: "http://otel-collector.observability.svc.cluster.local:4318/v1/traces"
+      resource_attributes:
+        service.name: kong-gateway
+        deployment.environment: poc
+      headers: {}
+      header_type: preserve
+
+  # HTTP Log - Logs API (utilise le serializer natif avec set_serialize_value)
+  # → Index: kong-api-logs
+  - name: http-log
+    config:
+      http_endpoint: "http://elasticsearch.observability.svc.cluster.local:9200/kong-api-logs/_doc"
+      method: POST
+      content_type: application/json
+      timeout: 10000
+      keepalive: 60000
+      queue:
+        max_batch_size: 1
+        max_coalescing_delay: 2
+        max_entries: 1000
+        max_retry_time: 60
+        initial_retry_delay: 0.01
+        max_retry_delay: 60
+
+  # Pre-function - Advanced request body capture with gzip support
+  - name: pre-function
+    tags:
+      - observability-platform
+    config:
+      access:
+        - |
+          local deflate_gzip = require("kong.tools.gzip").deflate_gzip
+
+          -- Enable buffering for request (response buffering not available via PDK)
+          kong.service.request.enable_buffering()
+
+          local headers = kong.request.get_headers()
+          local request_body = kong.request.get_raw_body()
+          local result_body
+
+          local content_length = headers["content-length"]
+          local content_encoding = headers["content-encoding"]
+          local max_loggable_size = 32000 -- Log column is 32768 bytes
+
+          if request_body and content_length and tonumber(content_length) < max_loggable_size then
+              -- For small request bodies (<32KB) we directly log them    
+
+              if (content_encoding and content_encoding == "gzip") then
+                  -- Special case when the server is already serving gzipped content
+                  result_body = ngx.encode_base64(request_body)
+              else
+                  result_body = request_body
+              end
+
+          elseif request_body and content_length then
+              -- For larger request bodies we gzip them and log them in base64
+
+              if (content_encoding and content_encoding == "gzip") then
+                  -- Special case
+                  result_body = ngx.encode_base64(request_body)
+              else
+                  result_body = ngx.encode_base64(deflate_gzip(request_body))
+              end
+
+          elseif (not request_body) and content_length then
+              -- If we have no request_body but content-length is present then it means that
+              -- kong was not able to buffer the body.
+              result_body = "Request body is too big to be logged!"
+          else
+              -- This is when no request body is present
+              result_body = ""
+          end
+
+          -- The following hides body when using protected api
+
+          if kong.request.get_path() == "/api/v1/me/credentials" and kong.request.get_method() == "PUT" then
+            result_body = "SENSITIVE"
+          end
+
+          kong.log.set_serialize_value("request.body", result_body)
+          kong.ctx.shared.request_body = result_body
+      body_filter:
+        - |
+          local deflate_gzip = require("kong.tools.gzip").deflate_gzip
+          local source = kong.response.get_source()
+          local max_loggable_size = 32000 -- Log column is 32768 bytes
+
+          if source == "service" then
+              -- We arrive here if the response was generated from a call to an upstream service and not
+              -- terminated for instance by a kong plugin 
+              
+              -- Extract upstream response
+              local upstream_headers = kong.service.response.get_headers()
+              -- Use kong.response.get_raw_body() instead of kong.service.response.get_raw_body()
+              -- as the latter requires upstream buffering which is not enabled.
+              local upstream_body = kong.response.get_raw_body()
+              local upstream_result_body = ""
+              local upstream_result_status = kong.service.response.get_status()
+
+              if upstream_body and tonumber(ngx.var.body_bytes_sent) < max_loggable_size then
+                  -- For small request bodies (<16KB) we directly log them
+                  if (upstream_headers["content-encoding"] and upstream_headers["content-encoding"] == "gzip") then
+                      upstream_result_body = ngx.encode_base64(upstream_body)
+                  else
+                     -- Put it in one line for saving space
+                      upstream_result_body = upstream_body
+                  end
+              elseif upstream_body then
+                  -- For larger request bodies we gzip them and log them in base64
+                  if (upstream_headers["content-encoding"] and upstream_headers["content-encoding"] == "gzip") then
+                      upstream_result_body = ngx.encode_base64(upstream_body)
+                  else
+                      upstream_result_body = ngx.encode_base64(deflate_gzip(upstream_body))
+                  end
+              end
+              kong.log.set_serialize_value("upstream.response.body", upstream_result_body)
+              kong.log.set_serialize_value("upstream.response.status", upstream_result_status)
+          elseif source == "exit" then
+              -- We arrive here if the response was generated from a plugin which terminated the execution before
+              -- calling the service. This can be a request-termination or a custom plugin which invokes exit()
+              kong.log.set_serialize_value("upstream.response.body", "N/A Upstream not called. Kong plugin aborted the process!")
+              kong.log.set_serialize_value("upstream.response.status", "-1")
+          elseif source == "error" then
+              -- We arrive here if there was an error in Kong processing the call
+              kong.log.set_serialize_value("upstream.response.body", "N/A Upstream not called. Kong failed processing due to internal error")
+              kong.log.set_serialize_value("upstream.response.status", "-2")
+          end
+
+  # Post-function - Capture upstream request body and response body
+  - name: post-function
+    enabled: true
+    tags:
+      - observability-platform
+    config:
+      access:
+        - |
+          local deflate_gzip = require("kong.tools.gzip").deflate_gzip
+
+          kong.service.request.enable_buffering()
+
+          -- Obtain the full URI
+          local upstream_uri_with_path = ""
+          if ngx.ctx.balancer_data then
+              upstream_uri_with_path = ngx.ctx.balancer_data.scheme .. "://" .. ngx.ctx.balancer_data.host .. ":" .. ngx.ctx.balancer_data.port .. ngx.var.upstream_uri
+              if ngx.var.args then
+                  upstream_uri_with_path = upstream_uri_with_path .. "?" .. ngx.var.args
+              end
+              kong.log.set_serialize_value("upstream.url_extended", upstream_uri_with_path)
+          end
+
+          local headers = kong.request.get_headers()
+          local request_body = kong.request.get_raw_body() -- Here this has been eventually modified by other plugins
+          local result_body
+
+          local content_length = headers["content-length"]
+          local content_encoding = headers["content-encoding"]
+          local max_loggable_size = 32000 -- Log column is 32768 bytes
+
+          if request_body and content_length and tonumber(content_length) < max_loggable_size then
+              -- For small request bodies (<16KB) we directly log them in a single line
+              if (content_encoding and content_encoding == "gzip") then
+                  -- Special case when the server is already serving gzipped content
+                  result_body = ngx.encode_base64(request_body)
+              else
+                  result_body = request_body
+              end
+          elseif request_body and content_length then
+              -- For larger request bodies we gzip them and log them in base64
+              if (content_encoding and content_encoding == "gzip") then
+                  result_body = ngx.encode_base64(request_body)
+              else
+                  result_body = ngx.encode_base64(deflate_gzip(request_body))
+              end
+          elseif (not request_body) and content_length then
+              -- If we have no request_body but content-length is present then it means that
+              -- kong was not able to buffer the body.
+              result_body = "Request body is too big to be logged!"
+          else
+              -- This is when no request body is present
+              result_body = ""
+          end
+
+          -- The following hides body when using protected api
+          if kong.request.get_path() == "/api/v1/me/credentials" and kong.request.get_method() == "PUT" then
+            result_body = "SENSITIVE"
+          end
+
+          kong.log.set_serialize_value("upstream.request.body", result_body)
+          kong.ctx.shared.upstreamcalled = "true"
+      body_filter:
+        - |
+          local deflate_gzip = require("kong.tools.gzip").deflate_gzip
+          local source = kong.response.get_source()
+          local max_loggable_size = 32000 -- Log column is 32768 bytes
+
+          if source == "service" then
+              -- We arrive here if the response was generated from a call to an upstream service and not
+              -- terminated for instance by a kong plugin 
+              
+              local downstream_headers = kong.service.response.get_headers()
+              local downstream_body = kong.response.get_raw_body()
+              local downstream_result_body = ""
+
+              if downstream_body and tonumber(string.len(ngx.arg[1])) < max_loggable_size then
+                  -- For small request bodies (<32KB) we directly log them
+                  if (downstream_headers["content-encoding"] and downstream_headers["content-encoding"] == "gzip") then
+                      downstream_result_body = ngx.encode_base64(downstream_body)
+                  else
+                      downstream_result_body = downstream_body
+                  end
+              elseif downstream_body then
+                  -- For larger request bodies we gzip them and log them in base64
+                  if (downstream_headers["content-encoding"] and downstream_headers["content-encoding"] == "gzip") then
+                      downstream_result_body = ngx.encode_base64(downstream_body)
+                  else
+                      downstream_result_body = ngx.encode_base64(deflate_gzip(downstream_body))
+                  end
+              end
+              kong.log.set_serialize_value("response.body", downstream_result_body)
+          elseif source == "exit" then
+              -- We arrive here if the response was generated from a plugin which terminated the execution before
+              -- calling the service. This can be a request-termination or a custom plugin which invokes exit()
+              if kong.ctx.shared.exit_transformer_message then
+                  -- Special case for exit transformer plugin
+                  kong.log.set_serialize_value("response.body", kong.ctx.shared.exit_transformer_message)
+              end
+          elseif source == "error" then
+              -- We arrive here if there was an error in Kong processing the call - nothing to do
+          end
+
+  # Note: Fluent Bit collecte aussi les logs stdout Kong
+  # → Index: kong-logs (logs système)
+
+upstreams:
+  - name: multi-region-upstream
+    algorithm: least-connections
+    tags:
+      - poc-observability
+    healthchecks:
+      # Active Health Checks (Proactive probing)
+      active:
+        type: http
+        http_path: "/"
+        timeout: 1
+        concurrency: 10
+        healthy:
+          interval: 5
+          successes: 1
+        unhealthy:
+          interval: 5
+          http_failures: 1
+          tcp_failures: 1
+          timeouts: 1
+      # Passive Health Checks (Circuit Breaker)
+      passive:
+        type: http
+        healthy:
+          successes: 0 # Passive checks generally don't mark as healthy automatically without active checks
+        unhealthy:
+          http_failures: 3 # Circuit breaker trips after 3 errors
+          http_statuses: [500, 503]
+          tcp_failures: 3
+          timeouts: 3
+    targets:
+      - target: backend-eu.kong.svc.cluster.local:80
+        weight: 80
+      - target: backend-us.kong.svc.cluster.local:80
+        weight: 20
+
+services:
+  # Local echo service to inspect headers accurately  
+  - name: local-echo
+    tags:
+      - poc-observability
+    url: http://echo-server.kong.svc.cluster.local:80
+    routes:
+      - name: local-echo-route
+        tags:
+          - poc-observability
+        paths:
+          - /local-echo
+        strip_path: true
+    plugins:
+      - name: post-function
+        config:
+          access:
+            - |
+              -- Override X-Forwarded-For to 1.1.1.1 using Nginx variable
+              -- This is the correct way to modify XFF for upstream
+              ngx.var.upstream_x_forwarded_for = "1.1.1.1"
+
+  # Kong Air Flights API
+  - name: kong-air-flights
+    tags:
+      - poc-observability
+    url: https://api.kong-air.com
+    routes:
+      - name: flights-route
+        tags:
+          - poc-observability
+        paths:
+          - /flights
+        strip_path: false
+
+  - name: geographic-service
+    host: multi-region-upstream
+    port: 80
+    protocol: http
+    tags:
+      - poc-observability
+    routes:
+      - name: geo-route
+        tags:
+          - poc-observability
+        paths:
+          - /geo-test
+        strip_path: true
+

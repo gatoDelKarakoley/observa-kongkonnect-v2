@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# Secrets & Certificates
+.konnect_token
+certs/
+
+# Temporary / Debug
+debug_dump.yaml
+*.backup-*
+
+# IDE
+.vscode/
+.idea/
+
+# Node (if any tooling added later)
+node_modules/
